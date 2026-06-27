@@ -1,0 +1,125 @@
+const express = require("express");
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const rateLimit = require("express-rate-limit");
+
+const app = express();
+app.use(express.json());
+
+const SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
+const REFRESH_SECRET = process.env.REFRESH_SECRET || "refresh-secret-key";
+
+// 模拟数据库
+const users = new Map();
+const refreshTokenStore = new Set();
+const blacklist = new Set();
+
+// 限流：登录接口每15分钟最多10次
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: "Too many login attempts, please try again later." },
+});
+
+// 生成 Token
+function generateTokens(payload) {
+  const accessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
+  const refreshToken = jwt.sign(payload, REFRESH_SECRET, { expiresIn: "7d" });
+  refreshTokenStore.add(refreshToken);
+  return { accessToken, refreshToken };
+}
+
+// 中间件：验证 Access Token
+function authenticate(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing or invalid Authorization header" });
+  }
+  const token = authHeader.split(" ")[1];
+  if (blacklist.has(token)) {
+    return res.status(401).json({ error: "Token has been revoked" });
+  }
+  try {
+    const decoded = jwt.verify(token, SECRET);
+    req.user = decoded;
+    req.token = token;
+    next();
+  } catch (err) {
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token expired", code: "TOKEN_EXPIRED" });
+    }
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// 中间件：角色权限控制
+function authorize(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Insufficient permissions" });
+    }
+    next();
+  };
+}
+
+// 注册
+app.post("/auth/register", async (req, res) => {
+  const { username, password, email } = req.body;
+  if (!username || !password || !email) {
+    return res.status(400).json({ error: "All fields are required" });
+  }
+  if (users.has(username)) {
+    return res.status(409).json({ error: "Username already exists" });
+  }
+  const hashed = await bcrypt.hash(password, 12);
+  const user = { username, email, password: hashed, role: "user", createdAt: new Date() };
+  users.set(username, user);
+  res.status(201).json({ message: "User registered successfully" });
+});
+
+// 登录
+app.post("/auth/login", loginLimiter, async (req, res) => {
+  const { username, password } = req.body;
+  const user = users.get(username);
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+  const tokens = generateTokens({ sub: username, role: user.role, email: user.email });
+  res.json({ ...tokens, expiresIn: 900 });
+});
+
+// 刷新 Token
+app.post("/auth/refresh", (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken || !refreshTokenStore.has(refreshToken)) {
+    return res.status(401).json({ error: "Invalid refresh token" });
+  }
+  try {
+    const decoded = jwt.verify(refreshToken, REFRESH_SECRET);
+    refreshTokenStore.delete(refreshToken);
+    const tokens = generateTokens({ sub: decoded.sub, role: decoded.role, email: decoded.email });
+    res.json(tokens);
+  } catch {
+    return res.status(401).json({ error: "Refresh token expired or invalid" });
+  }
+});
+
+// 登出（撤销 Token）
+app.post("/auth/logout", authenticate, (req, res) => {
+  blacklist.add(req.token);
+  const { refreshToken } = req.body;
+  if (refreshToken) refreshTokenStore.delete(refreshToken);
+  res.json({ message: "Logged out successfully" });
+});
+
+// 受保护路由示例
+app.get("/api/profile", authenticate, (req, res) => {
+  const user = users.get(req.user.sub);
+  res.json({ username: user.username, email: user.email, role: user.role });
+});
+
+app.get("/api/admin", authenticate, authorize("admin"), (req, res) => {
+  res.json({ message: "Welcome, admin!", users: [...users.keys()] });
+});
+
+app.listen(3000, () => console.log("Auth server running on :3000"));
